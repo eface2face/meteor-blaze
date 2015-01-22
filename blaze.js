@@ -4,6 +4,7 @@ var Meteor = require("meteor-core");
 var HTML = require("meteor-htmljs");
 var ObserveSequence = require("meteor-observe-sequence");
 var ReactiveVar = require("meteor-reactive-var");
+var Blaze;
 
 /**
  * @namespace Blaze
