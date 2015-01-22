@@ -1,10 +1,10 @@
-var _ = require("lodash");
-var jQuery = require("jquery");
-var Meteor = require("meteor-core");
-var HTML = require("meteor-htmljs");
-var ObserveSequence = require("meteor-observe-sequence");
-var ReactiveVar = require("meteor-reactive-var");
-var Blaze;
+module.exports = function(Meteor,jQuery) {
+  var _ = Meteor.underscore;
+  var HTML = Meteor.HTML;
+  var ObserveSequence = Meteor.ObserveSequence;
+  var ReactiveVar = Meteor.ReactiveVar;
+  var Tracker = Meteor.Tracker;
+  var Blaze;
 
 /**
  * @namespace Blaze
@@ -2985,4 +2985,6 @@ Template.parentData = Blaze._parentData;
  * @param {Function} function The helper function itself.
  */
 Template.registerHelper = Blaze.registerHelper;
-module.exports = Blaze;
+  Meteor.Blaze = Blaze;
+  Meteor.jQuery = jQuery;
+};
