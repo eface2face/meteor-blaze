@@ -5,7 +5,6 @@ module.exports = function(Meteor,jQuery) {
   var ReactiveVar = Meteor.ReactiveVar;
   var Tracker = Meteor.Tracker;
   var Blaze;
-  Blaze.ReactiveVar = ReactiveVar;
 
 /**
  * @namespace Blaze
