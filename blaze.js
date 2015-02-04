@@ -1644,9 +1644,13 @@ Blaze.View.prototype.autorun = function (f, _inViewScope) {
     throw new Error("Can't call View#autorun from a Tracker Computation; try calling it from the created or rendered callback");
   }
 
+  var templateInstanceFunc = Blaze.Template._currentTemplateInstanceFunc;
+
   var c = Tracker.autorun(function viewAutorun(c) {
     return Blaze._withCurrentView(_inViewScope || self, function () {
-      return f.call(self, c);
+      return Blaze.Template._withTemplateInstanceFunc(templateInstanceFunc, function () {
+        return f.call(self, c);
+      });
     });
   });
   self.onViewDestroyed(function () { c.stop(); });
@@ -2226,9 +2230,10 @@ Blaze._addEventMap = function (view, eventMap, thisInHandler) {
               return null;
             var handlerThis = thisInHandler || this;
             var handlerArgs = arguments;
-            return Blaze._withCurrentView(view, function () {
-              return handler.apply(handlerThis, handlerArgs);
-            });
+            return Blaze._withCurrentView(Blaze.getView(evt.currentTarget),
+              function () {
+                return handler.apply(handlerThis, handlerArgs);
+              });
           },
           range, function (r) {
             return r.parentRange;
@@ -2512,13 +2517,10 @@ Blaze.registerHelper = function (name, func) {
   Blaze._globalHelpers[name] = func;
 };
 
-
 var bindIfIsFunction = function (x, target) {
   if (typeof x !== 'function')
     return x;
-  return function () {
-    return x.apply(target, arguments);
-  };
+  return _.bind(x, target);
 };
 
 // If `x` is a function, binds the value of `this` for that function
@@ -2567,8 +2569,19 @@ var getTemplateHelper = Blaze._getTemplateHelper = function (template, name) {
   return null;
 };
 
-var wrapHelper = function (f) {
-  return Blaze._wrapCatchingExceptions(f, 'template helper');
+var wrapHelper = function (f, templateFunc) {
+  if (typeof f !== "function") {
+    return f;
+  }
+
+  return function () {
+    var self = this;
+    var args = arguments;
+
+    return Template._withTemplateInstanceFunc(templateFunc, function () {
+      return Blaze._wrapCatchingExceptions(f, 'template helper').apply(self, args);
+    });
+  };
 };
 
 // Looks up a name, like "foo" or "..", as a helper of the
@@ -2589,6 +2602,11 @@ Blaze.View.prototype.lookup = function (name, _options) {
   var template = this.template;
   var lookupTemplate = _options && _options.template;
   var helper;
+  var boundTmplInstance;
+
+  if (this.templateInstance) {
+    boundTmplInstance = _.bind(this.templateInstance, this);
+  }
 
   if (/^\./.test(name)) {
     // starts with a dot. must be a series of dots which maps to an
@@ -2600,12 +2618,13 @@ Blaze.View.prototype.lookup = function (name, _options) {
 
   } else if (template &&
              ((helper = getTemplateHelper(template, name)) != null)) {
-    return wrapHelper(bindDataContext(helper));
+    return wrapHelper(bindDataContext(helper), boundTmplInstance);
   } else if (lookupTemplate && (name in Blaze.Template) &&
              (Blaze.Template[name] instanceof Blaze.Template)) {
     return Blaze.Template[name];
   } else if (Blaze._globalHelpers[name] != null) {
-    return wrapHelper(bindDataContext(Blaze._globalHelpers[name]));
+    return wrapHelper(bindDataContext(Blaze._globalHelpers[name]),
+      boundTmplInstance);
   } else {
     return function () {
       var isCalledAsFunction = (arguments.length > 0);
@@ -2765,9 +2784,13 @@ Template.prototype._getCallbacks = function (which) {
 };
 
 var fireCallbacks = function (callbacks, template) {
-  for (var i = 0, N = callbacks.length; i < N; i++) {
-    callbacks[i].call(template);
-  }
+  Template._withTemplateInstanceFunc(
+    function () { return template; },
+    function () {
+      for (var i = 0, N = callbacks.length; i < N; i++) {
+        callbacks[i].call(template);
+      }
+    });
 };
 
 Template.prototype.constructView = function (contentFunc, elseFunc) {
@@ -2974,6 +2997,25 @@ Template.prototype.helpers = function (dict) {
     this.__helpers.set(k, dict[k]);
 };
 
+// Kind of like Blaze.currentView but for the template instance.
+// This is a function, not a value -- so that not all helpers
+// are implicitly dependent on the current template instance's `data` property,
+// which would make them dependenct on the data context of the template
+// inclusion.
+Template._currentTemplateInstanceFunc = null;
+
+Template._withTemplateInstanceFunc = function (templateInstanceFunc, func) {
+  if (typeof func !== 'function')
+    throw new Error("Expected function, got: " + func);
+  var oldTmplInstanceFunc = Template._currentTemplateInstanceFunc;
+  try {
+    Template._currentTemplateInstanceFunc = templateInstanceFunc;
+    return func();
+  } finally {
+    Template._currentTemplateInstanceFunc = oldTmplInstanceFunc;
+  }
+};
+
 /**
  * @summary Specify event handlers for this template.
  * @locus Client
@@ -2990,9 +3032,12 @@ Template.prototype.events = function (eventMap) {
         if (data == null)
           data = {};
         var args = Array.prototype.slice.call(arguments);
-        var tmplInstance = view.templateInstance();
-        args.splice(1, 0, tmplInstance);
-        return v.apply(data, args);
+        var tmplInstanceFunc = _.bind(view.templateInstance, view);
+        args.splice(1, 0, tmplInstanceFunc());
+
+        return Template._withTemplateInstanceFunc(tmplInstanceFunc, function () {
+          return v.apply(data, args);
+        });
       };
     })(k, eventMap[k]);
   }
@@ -3009,22 +3054,24 @@ Template.prototype.events = function (eventMap) {
  * @returns Blaze.TemplateInstance
  */
 Template.instance = function () {
-  var view = Blaze.currentView;
-
-  while (view && ! view.template)
-    view = view.parentView;
-
-  if (! view)
-    return null;
-
-  return view.templateInstance();
+  return Template._currentTemplateInstanceFunc
+    && Template._currentTemplateInstanceFunc();
 };
 
 // Note: Template.currentData() is documented to take zero arguments,
 // while Blaze.getData takes up to one.
 
 /**
- * @summary Returns the data context of the current helper, or the data context of the template that declares the current event handler or callback.  Establishes a reactive dependency on the result.
+ * @summary
+ *
+ * - Inside an `onCreated`, `onRendered`, or `onDestroyed` callback, returns
+ * the data context of the template.
+ * - Inside a helper, returns the data context of the DOM node where the helper
+ * was used.
+ * - Inside an event handler, returns the data context of the element that fired
+ * the event.
+ *
+ * Establishes a reactive dependency on the result.
  * @locus Client
  * @function
  */
