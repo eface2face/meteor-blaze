@@ -1080,10 +1080,11 @@ var BooleanHandler = AttributeHandler.extend({
   }
 });
 
-var ValueHandler = AttributeHandler.extend({
+var DOMPropertyHandler = AttributeHandler.extend({
   update: function (element, oldValue, value) {
-    if (value !== element.value)
-      element.value = value;
+    var name = this.name;
+    if (value !== element[name])
+      element[name] = value;
   }
 });
 
@@ -1207,7 +1208,7 @@ makeAttributeHandler = function (elem, name, value) {
              && name === 'value') {
     // internally, TEXTAREAs tracks their value in the 'value'
     // attribute just like INPUTs.
-    return new ValueHandler(name, value);
+    return new DOMPropertyHandler(name, value);
   } else if (name.substring(0,6) === 'xlink:') {
     return new XlinkHandler(name.substring(6), value);
   } else if (isUrlAttribute(elem.tagName, name)) {
@@ -1270,131 +1271,179 @@ ElementAttributesUpdater.prototype.update = function(newAttrs) {
     }
   }
 };
-// new Blaze._DOMMaterializer(options)
+// Turns HTMLjs into DOM nodes and DOMRanges.
 //
-// An HTML.Visitor that turns HTMLjs into DOM nodes and DOMRanges.
+// - `htmljs`: the value to materialize, which may be any of the htmljs
+//   types (Tag, CharRef, Comment, Raw, array, string, boolean, number,
+//   null, or undefined) or a View or Template (which will be used to
+//   construct a View).
+// - `intoArray`: the array of DOM nodes and DOMRanges to push the output
+//   into (required)
+// - `parentView`: the View we are materializing content for (optional)
+// - `_existingWorkStack`: optional argument, only used for recursive
+//   calls when there is some other _materializeDOM on the call stack.
+//   If _materializeDOM called your function and passed in a workStack,
+//   pass it back when you call _materializeDOM (such as from a workStack
+//   task).
 //
-// Options: `parentView`
-Blaze._DOMMaterializer = HTML.Visitor.extend();
-Blaze._DOMMaterializer.def({
-  visitNull: function (x, intoArray) {
-    return intoArray;
-  },
-  visitPrimitive: function (primitive, intoArray) {
-    var string = String(primitive);
-    intoArray.push(document.createTextNode(string));
-    return intoArray;
-  },
-  visitCharRef: function (charRef, intoArray) {
-    return this.visitPrimitive(charRef.str, intoArray);
-  },
-  visitArray: function (array, intoArray) {
-    for (var i = 0; i < array.length; i++)
-      this.visit(array[i], intoArray);
-    return intoArray;
-  },
-  visitComment: function (comment, intoArray) {
-    intoArray.push(document.createComment(comment.sanitizedValue));
-    return intoArray;
-  },
-  visitRaw: function (raw, intoArray) {
-    // Get an array of DOM nodes by using the browser's HTML parser
-    // (like innerHTML).
-    var nodes = Blaze._DOMBackend.parseHTML(raw.value);
-    for (var i = 0; i < nodes.length; i++)
-      intoArray.push(nodes[i]);
+// Returns `intoArray`, which is especially useful if you pass in `[]`.
+Blaze._materializeDOM = function (htmljs, intoArray, parentView,
+                                  _existingWorkStack) {
+  // In order to use fewer stack frames, materializeDOMInner can push
+  // tasks onto `workStack`, and they will be popped off
+  // and run, last first, after materializeDOMInner returns.  The
+  // reason we use a stack instead of a queue is so that we recurse
+  // depth-first, doing newer tasks first.
+  var workStack = (_existingWorkStack || []);
+  materializeDOMInner(htmljs, intoArray, parentView, workStack);
 
-    return intoArray;
-  },
-  visitTag: function (tag, intoArray) {
-    var self = this;
-    var tagName = tag.tagName;
-    var elem;
-    if ((HTML.isKnownSVGElement(tagName) || isSVGAnchor(tag))
-        && document.createElementNS) {
-      // inline SVG
-      elem = document.createElementNS('http://www.w3.org/2000/svg', tagName);
+  if (! _existingWorkStack) {
+    // We created the work stack, so we are responsible for finishing
+    // the work.  Call each "task" function, starting with the top
+    // of the stack.
+    while (workStack.length) {
+      // Note that running task() may push new items onto workStack.
+      var task = workStack.pop();
+      task();
+    }
+  }
+
+  return intoArray;
+};
+
+var materializeDOMInner = function (htmljs, intoArray, parentView, workStack) {
+  if (htmljs == null) {
+    // null or undefined
+    return;
+  }
+
+  switch (typeof htmljs) {
+  case 'string': case 'boolean': case 'number':
+    intoArray.push(document.createTextNode(String(htmljs)));
+    return;
+  case 'object':
+    if (htmljs.htmljsType) {
+      switch (htmljs.htmljsType) {
+      case HTML.Tag.htmljsType:
+        intoArray.push(materializeTag(htmljs, parentView, workStack));
+        return;
+      case HTML.CharRef.htmljsType:
+        intoArray.push(document.createTextNode(htmljs.str));
+        return;
+      case HTML.Comment.htmljsType:
+        intoArray.push(document.createComment(htmljs.sanitizedValue));
+        return;
+      case HTML.Raw.htmljsType:
+        // Get an array of DOM nodes by using the browser's HTML parser
+        // (like innerHTML).
+        var nodes = Blaze._DOMBackend.parseHTML(htmljs.value);
+        for (var i = 0; i < nodes.length; i++)
+          intoArray.push(nodes[i]);
+        return;
+      }
+    } else if (HTML.isArray(htmljs)) {
+      for (var i = htmljs.length-1; i >= 0; i--) {
+        workStack.push(_.bind(Blaze._materializeDOM, null,
+                              htmljs[i], intoArray, parentView, workStack));
+      }
+      return;
     } else {
-      // normal elements
-      elem = document.createElement(tagName);
-    }
-
-    var rawAttrs = tag.attrs;
-    var children = tag.children;
-    if (tagName === 'textarea' && tag.children.length &&
-        ! (rawAttrs && ('value' in rawAttrs))) {
-      // Provide very limited support for TEXTAREA tags with children
-      // rather than a "value" attribute.
-      // Reactivity in the form of Views nested in the tag's children
-      // won't work.  Compilers should compile textarea contents into
-      // the "value" attribute of the tag, wrapped in a function if there
-      // is reactivity.
-      if (typeof rawAttrs === 'function' ||
-          HTML.isArray(rawAttrs)) {
-        throw new Error("Can't have reactive children of TEXTAREA node; " +
-                        "use the 'value' attribute instead.");
+      if (htmljs instanceof Blaze.Template) {
+        htmljs = htmljs.constructView();
+        // fall through to Blaze.View case below
       }
-      rawAttrs = _.extend({}, rawAttrs || null);
-      rawAttrs.value = Blaze._expand(children, self.parentView);
-      children = [];
+      if (htmljs instanceof Blaze.View) {
+        Blaze._materializeView(htmljs, parentView, workStack, intoArray);
+        return;
+      }
     }
+  }
 
-    if (rawAttrs) {
-      var attrUpdater = new ElementAttributesUpdater(elem);
-      var updateAttributes = function () {
-        var parentView = self.parentView;
-        var expandedAttrs = Blaze._expandAttributes(rawAttrs, parentView);
-        var flattenedAttrs = HTML.flattenAttributes(expandedAttrs);
-        var stringAttrs = {};
-        for (var attrName in flattenedAttrs) {
-          stringAttrs[attrName] = Blaze._toText(flattenedAttrs[attrName],
-                                                parentView,
-                                                HTML.TEXTMODE.STRING);
-        }
-        attrUpdater.update(stringAttrs);
-      };
-      var updaterComputation;
-      if (self.parentView) {
-        updaterComputation =
-          self.parentView.autorun(updateAttributes, undefined, 'updater');
-      } else {
-        updaterComputation = Tracker.nonreactive(function () {
-          return Tracker.autorun(function () {
-            Tracker._withCurrentView(self.parentView, updateAttributes);
-          });
+  throw new Error("Unexpected object in htmljs: " + htmljs);
+};
+
+var materializeTag = function (tag, parentView, workStack) {
+  var tagName = tag.tagName;
+  var elem;
+  if ((HTML.isKnownSVGElement(tagName) || isSVGAnchor(tag))
+      && document.createElementNS) {
+    // inline SVG
+    elem = document.createElementNS('http://www.w3.org/2000/svg', tagName);
+  } else {
+    // normal elements
+    elem = document.createElement(tagName);
+  }
+
+  var rawAttrs = tag.attrs;
+  var children = tag.children;
+  if (tagName === 'textarea' && tag.children.length &&
+      ! (rawAttrs && ('value' in rawAttrs))) {
+    // Provide very limited support for TEXTAREA tags with children
+    // rather than a "value" attribute.
+    // Reactivity in the form of Views nested in the tag's children
+    // won't work.  Compilers should compile textarea contents into
+    // the "value" attribute of the tag, wrapped in a function if there
+    // is reactivity.
+    if (typeof rawAttrs === 'function' ||
+        HTML.isArray(rawAttrs)) {
+      throw new Error("Can't have reactive children of TEXTAREA node; " +
+                      "use the 'value' attribute instead.");
+    }
+    rawAttrs = _.extend({}, rawAttrs || null);
+    rawAttrs.value = Blaze._expand(children, parentView);
+    children = [];
+  }
+
+  if (rawAttrs) {
+    var attrUpdater = new ElementAttributesUpdater(elem);
+    var updateAttributes = function () {
+      var expandedAttrs = Blaze._expandAttributes(rawAttrs, parentView);
+      var flattenedAttrs = HTML.flattenAttributes(expandedAttrs);
+      var stringAttrs = {};
+      for (var attrName in flattenedAttrs) {
+        stringAttrs[attrName] = Blaze._toText(flattenedAttrs[attrName],
+                                              parentView,
+                                              HTML.TEXTMODE.STRING);
+      }
+      attrUpdater.update(stringAttrs);
+    };
+    var updaterComputation;
+    if (parentView) {
+      updaterComputation =
+        parentView.autorun(updateAttributes, undefined, 'updater');
+    } else {
+      updaterComputation = Tracker.nonreactive(function () {
+        return Tracker.autorun(function () {
+          Tracker._withCurrentView(parentView, updateAttributes);
         });
-      }
-      Blaze._DOMBackend.Teardown.onElementTeardown(elem, function attrTeardown() {
-        updaterComputation.stop();
       });
     }
-
-    var childNodesAndRanges = self.visit(children, []);
-    for (var i = 0; i < childNodesAndRanges.length; i++) {
-      var x = childNodesAndRanges[i];
-      if (x instanceof Blaze._DOMRange)
-        x.attach(elem);
-      else
-        elem.appendChild(x);
-    }
-
-    intoArray.push(elem);
-
-    return intoArray;
-  },
-  visitObject: function (x, intoArray) {
-    if (x instanceof Blaze.Template)
-      x = x.constructView();
-
-    if (x instanceof Blaze.View) {
-      intoArray.push(Blaze._materializeView(x, this.parentView));
-      return intoArray;
-    }
-
-    // throw the default error
-    return HTML.Visitor.prototype.visitObject.call(this, x);
+    Blaze._DOMBackend.Teardown.onElementTeardown(elem, function attrTeardown() {
+      updaterComputation.stop();
+    });
   }
-});
+
+  if (children.length) {
+    var childNodesAndRanges = [];
+    // push this function first so that it's done last
+    workStack.push(function () {
+      for (var i = 0; i < childNodesAndRanges.length; i++) {
+        var x = childNodesAndRanges[i];
+        if (x instanceof Blaze._DOMRange)
+          x.attach(elem);
+        else
+          elem.appendChild(x);
+      }
+    });
+    // now push the task that calculates childNodesAndRanges
+    workStack.push(_.bind(Blaze._materializeDOM, null,
+                          children, childNodesAndRanges, parentView,
+                          workStack));
+  }
+
+  return elem;
+};
+
 
 var isSVGAnchor = function (node) {
   // We generally aren't able to detect SVG <a> elements because
@@ -1698,7 +1747,7 @@ Blaze.View.prototype._errorIfShouldntCallSubscribe = function () {
  */
 Blaze.View.prototype.subscribe = function (args, options) {
   var self = this;
-  options = {} || options;
+  options = options || {};
 
   self._errorIfShouldntCallSubscribe();
 
@@ -1752,7 +1801,48 @@ Blaze._createView = function (view, parentView, forExpansion) {
   Blaze._fireCallbacks(view, 'created');
 };
 
-Blaze._materializeView = function (view, parentView) {
+var doFirstRender = function (view, initialContent) {
+  var domrange = new Blaze._DOMRange(initialContent);
+  view._domrange = domrange;
+  domrange.view = view;
+  view.isRendered = true;
+  Blaze._fireCallbacks(view, 'rendered');
+
+  var teardownHook = null;
+
+  domrange.onAttached(function attached(range, element) {
+    view._isAttached = true;
+
+    teardownHook = Blaze._DOMBackend.Teardown.onElementTeardown(
+      element, function teardown() {
+        Blaze._destroyView(view, true /* _skipNodes */);
+      });
+  });
+
+  // tear down the teardown hook
+  view.onViewDestroyed(function () {
+    teardownHook && teardownHook.stop();
+    teardownHook = null;
+  });
+
+  return domrange;
+};
+
+// Take an uncreated View `view` and create and render it to DOM,
+// setting up the autorun that updates the View.  Returns a new
+// DOMRange, which has been associated with the View.
+//
+// The private arguments `_workStack` and `_intoArray` are passed in
+// by Blaze._materializeDOM and are only present for recursive calls
+// (when there is some other _materializeView on the stack).  If
+// provided, then we avoid the mutual recursion of calling back into
+// Blaze._materializeDOM so that deep View hierarchies don't blow the
+// stack.  Instead, we push tasks onto workStack for the initial
+// rendering and subsequent setup of the View, and they are done after
+// we return.  When there is a _workStack, we do not return the new
+// DOMRange, but instead push it into _intoArray from a _workStack
+// task.
+Blaze._materializeView = function (view, parentView, _workStack, _intoArray) {
   Blaze._createView(view, parentView);
 
   var domrange;
@@ -1769,21 +1859,16 @@ Blaze._materializeView = function (view, parentView) {
       var htmljs = view._render();
       view._isInRender = false;
 
-      Tracker.nonreactive(function doMaterialize() {
-        var materializer = new Blaze._DOMMaterializer({parentView: view});
-        var rangesAndNodes = materializer.visit(htmljs, []);
-        if (c.firstRun || ! Blaze._isContentEqual(lastHtmljs, htmljs)) {
-          if (c.firstRun) {
-            domrange = new Blaze._DOMRange(rangesAndNodes);
-            view._domrange = domrange;
-            domrange.view = view;
-            view.isRendered = true;
-          } else {
+      if (! c.firstRun) {
+        Tracker.nonreactive(function doMaterialize() {
+          // re-render
+          var rangesAndNodes = Blaze._materializeDOM(htmljs, [], view);
+          if (! Blaze._isContentEqual(lastHtmljs, htmljs)) {
             domrange.setMembers(rangesAndNodes);
+            Blaze._fireCallbacks(view, 'rendered');
           }
-          Blaze._fireCallbacks(view, 'rendered');
-        }
-      });
+        });
+      }
       lastHtmljs = htmljs;
 
       // Causes any nested views to stop immediately, not when we call
@@ -1791,29 +1876,44 @@ Blaze._materializeView = function (view, parentView) {
       // helpers in the DOM tree to be replaced might be scheduled
       // to re-run before we have a chance to stop them.
       Tracker.onInvalidate(function () {
-        domrange.destroyMembers();
+        if (domrange) {
+          domrange.destroyMembers();
+        }
       });
     }, undefined, 'materialize');
 
-    var teardownHook = null;
-
-    domrange.onAttached(function attached(range, element) {
-      view._isAttached = true;
-
-      teardownHook = Blaze._DOMBackend.Teardown.onElementTeardown(
-        element, function teardown() {
-          Blaze._destroyView(view, true /* _skipNodes */);
-        });
-    });
-
-    // tear down the teardown hook
-    view.onViewDestroyed(function () {
-      teardownHook && teardownHook.stop();
-      teardownHook = null;
-    });
+    // first render.  lastHtmljs is the first htmljs.
+    var initialContents;
+    if (! _workStack) {
+      initialContents = Blaze._materializeDOM(lastHtmljs, [], view);
+      domrange = doFirstRender(view, initialContents);
+      initialContents = null; // help GC because we close over this scope a lot
+    } else {
+      // We're being called from Blaze._materializeDOM, so to avoid
+      // recursion and save stack space, provide a description of the
+      // work to be done instead of doing it.  Tasks pushed onto
+      // _workStack will be done in LIFO order after we return.
+      // The work will still be done within a Tracker.nonreactive,
+      // because it will be done by some call to Blaze._materializeDOM
+      // (which is always called in a Tracker.nonreactive).
+      initialContents = [];
+      // push this function first so that it happens last
+      _workStack.push(function () {
+        domrange = doFirstRender(view, initialContents);
+        initialContents = null; // help GC because of all the closures here
+        _intoArray.push(domrange);
+      });
+      // now push the task that calculates initialContents
+      _workStack.push(_.bind(Blaze._materializeDOM, null,
+                             lastHtmljs, initialContents, view, _workStack));
+    }
   });
 
-  return domrange;
+  if (! _workStack) {
+    return domrange;
+  } else {
+    return null;
+  }
 };
 
 // Expands a View to HTMLjs, calling `render` recursively on all
@@ -2450,15 +2550,17 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
       },
       changedAt: function (id, newItem, oldItem, index) {
         Tracker.nonreactive(function () {
-          var itemView;
           if (eachView.expandedValueDep) {
             eachView.expandedValueDep.changed();
-          } else if (eachView._domrange) {
-            itemView = eachView._domrange.getMember(index).view;
           } else {
-            itemView = eachView.initialSubviews[index];
+            var itemView;
+            if (eachView._domrange) {
+              itemView = eachView._domrange.getMember(index).view;
+            } else {
+              itemView = eachView.initialSubviews[index];
+            }
+            itemView.dataVar.set(newItem);
           }
-          itemView.dataVar.set(newItem);
         });
       },
       movedTo: function (id, item, fromIndex, toIndex) {
@@ -2635,14 +2737,14 @@ var wrapHelper = function (f, templateFunc) {
     var self = this;
     var args = arguments;
 
-    return Template._withTemplateInstanceFunc(templateFunc, function () {
+    return Blaze.Template._withTemplateInstanceFunc(templateFunc, function () {
       return Blaze._wrapCatchingExceptions(f, 'template helper').apply(self, args);
     });
   };
 };
 
 // Looks up a name, like "foo" or "..", as a helper of the
-// current template; a global helper; the name of a template;
+// current template; the name of a template; a global helper;
 // or a property of the data context.  Called on the View of
 // a template (i.e. a View with a `.template` property,
 // where the helpers are).  Used for the first name in a
@@ -3066,9 +3168,12 @@ Blaze.TemplateInstance.prototype.autorun = function (f) {
  * server's `publish()` call.
  * @param {Any} [arg1,arg2...] Optional arguments passed to publisher function
  * on server.
- * @param {Function|Object} [callbacks] Optional. May include `onStop` and
- * `onReady` callbacks. If a function is passed instead of an object, it is
- * interpreted as an `onReady` callback.
+ * @param {Function|Object} [options] If a function is passed instead of an
+ * object, it is interpreted as an `onReady` callback.
+ * @param {Function} [options.onReady] Passed to [`Meteor.subscribe`](#meteor_subscribe).
+ * @param {Function} [options.onStop] Passed to [`Meteor.subscribe`](#meteor_subscribe).
+ * @param {DDP.Connection} [options.connection] The connection on which to make the
+ * subscription.
  */
 Blaze.TemplateInstance.prototype.subscribe = function (/* arguments */) {
   var self = this;
@@ -3077,23 +3182,30 @@ Blaze.TemplateInstance.prototype.subscribe = function (/* arguments */) {
   var args = _.toArray(arguments);
 
   // Duplicate logic from Meteor.subscribe
-  var callbacks = {};
+  var options = {};
   if (args.length) {
     var lastParam = _.last(args);
-    if (_.isFunction(lastParam)) {
-      callbacks.onReady = args.pop();
-    } else if (lastParam &&
+
+    // Match pattern to check if the last arg is an options argument
+    var lastParamOptionsPattern = {
+      onReady: Match.Optional(Function),
       // XXX COMPAT WITH 1.0.3.1 onError used to exist, but now we use
       // onStop with an error callback instead.
-      _.any([lastParam.onReady, lastParam.onError, lastParam.onStop],
-        _.isFunction)) {
-      callbacks = args.pop();
+      onError: Match.Optional(Function),
+      onStop: Match.Optional(Function),
+      connection: Match.Optional(Match.Any)
+    };
+
+    if (_.isFunction(lastParam)) {
+      options.onReady = args.pop();
+    } else if (lastParam && Match.test(lastParam, lastParamOptionsPattern)) {
+      options = args.pop();
     }
   }
 
   var subHandle;
-  var oldStopped = callbacks.onStop;
-  callbacks.onStop = function (error) {
+  var oldStopped = options.onStop;
+  options.onStop = function (error) {
     // When the subscription is stopped, remove it from the set of tracked
     // subscriptions to avoid this list growing without bound
     delete subHandles[subHandle.subscriptionId];
@@ -3109,9 +3221,19 @@ Blaze.TemplateInstance.prototype.subscribe = function (/* arguments */) {
       oldStopped(error);
     }
   };
+
+  var connection = options.connection;
+  var callbacks = _.pick(options, ["onReady", "onError", "onStop"]);
+
+  // The callbacks are passed as the last item in the arguments array passed to
+  // View#subscribe
   args.push(callbacks);
 
-  subHandle = self.view.subscribe.call(self.view, args);
+  // View#subscribe takes the connection as one of the options in the last
+  // argument
+  subHandle = self.view.subscribe.call(self.view, args, {
+    connection: connection
+  });
 
   if (! _.has(subHandles, subHandle.subscriptionId)) {
     subHandles[subHandle.subscriptionId] = subHandle;
@@ -3207,7 +3329,7 @@ Template.prototype.events = function (eventMap) {
  * @memberOf Template
  * @summary The [template instance](#template_inst) corresponding to the current template helper, event handler, callback, or autorun.  If there isn't one, `null`.
  * @locus Client
- * @returns Blaze.TemplateInstance
+ * @returns {Blaze.TemplateInstance}
  */
 Template.instance = function () {
   return Template._currentTemplateInstanceFunc
