@@ -35,10 +35,9 @@ Blaze._escape = (function() {
 Blaze._warn = function (msg) {
   msg = 'Warning: ' + msg;
 
-  if ((typeof Log !== 'undefined') && Log && Log.warn)
-    Log.warn(msg); // use Meteor's "logging" package
-  else if ((typeof console !== 'undefined') && console.log)
-    console.log(msg);
+  if ((typeof console !== 'undefined') && console.warn) {
+    console.warn(msg);
+  }
 };
 var DOMBackend = {};
 Blaze._DOMBackend = DOMBackend;
@@ -1177,8 +1176,9 @@ var UrlHandler = AttributeHandler.extend({
       origUpdate.apply(self, args);
     } else {
       var isJavascriptProtocol = (getUrlProtocol(value) === "javascript:");
-      if (isJavascriptProtocol) {
-        Blaze._warn("URLs that use the 'javascript:' protocol are not " +
+      var isVBScriptProtocol   = (getUrlProtocol(value) === "vbscript:");
+      if (isJavascriptProtocol || isVBScriptProtocol) {
+        Blaze._warn("URLs that use the 'javascript:' or 'vbscript:' protocol are not " +
                     "allowed in URL attribute values. " +
                     "Call Blaze._allowJavascriptUrls() " +
                     "to enable them.");
@@ -1504,7 +1504,7 @@ Blaze._reportException = function (e, msg) {
   // In Chrome, `e.stack` is a multiline string that starts with the message
   // and contains a stack trace.  Furthermore, `console.log` makes it clickable.
   // `console.log` supplies the space between the two arguments.
-  debugFunc()(msg || 'Exception caught in template:', e.stack || e.message);
+  debugFunc()(msg || 'Exception caught in template:', e.stack || e.message || e);
 };
 
 Blaze._wrapCatchingExceptions = function (f, where) {
@@ -1600,6 +1600,9 @@ Blaze.View = function (name, render) {
   // this information to be available on views to make smarter decisions. For
   // example: removing the generated parent view with the view on Blaze.remove.
   this._hasGeneratedParent = false;
+  // Bindings accessible to children views (via view.lookup('name')) within the
+  // closest template view.
+  this._scopeBindings = {};
 
   this.renderCount = 0;
 };
@@ -1640,6 +1643,19 @@ Blaze.View.prototype.onViewReady = function (cb) {
 Blaze.View.prototype.onViewDestroyed = function (cb) {
   this._callbacks.destroyed = this._callbacks.destroyed || [];
   this._callbacks.destroyed.push(cb);
+};
+Blaze.View.prototype.removeViewDestroyedListener = function (cb) {
+  var destroyed = this._callbacks.destroyed;
+  if (! destroyed)
+    return;
+  var index = _.lastIndexOf(destroyed, cb);
+  if (index !== -1) {
+    // XXX You'd think the right thing to do would be splice, but _fireCallbacks
+    // gets sad if you remove callbacks while iterating over the list.  Should
+    // change this to use callback-hook or EventEmitter or something else that
+    // properly supports removal.
+    destroyed[index] = null;
+  }
 };
 
 /// View#autorun(func)
@@ -1695,35 +1711,31 @@ Blaze.View.prototype.autorun = function (f, _inViewScope, displayName) {
     throw new Error("Can't call View#autorun from a Tracker Computation; try calling it from the created or rendered callback");
   }
 
-  // Each local variable allocate additional space on each frame of the
-  // execution stack. When too many variables are allocated on stack, you can
-  // run out of memory on stack running a deep recursion (which is typical for
-  // Blaze functions) and get stackoverlow error. (The size of the stack varies
-  // between browsers).
-  // The trick we use here is to allocate only one variable on stack `locals`
-  // that keeps references to all the rest. Since locals is allocated on heap,
-  // we don't take up any space on the stack.
-  var locals = {};
-  locals.templateInstanceFunc = Blaze.Template._currentTemplateInstanceFunc;
+  var templateInstanceFunc = Blaze.Template._currentTemplateInstanceFunc;
 
-  locals.f = function viewAutorun(c) {
+  var func = function viewAutorun(c) {
     return Blaze._withCurrentView(_inViewScope || self, function () {
-      return Blaze.Template._withTemplateInstanceFunc(locals.templateInstanceFunc, function () {
-        return f.call(self, c);
-      });
+      return Blaze.Template._withTemplateInstanceFunc(
+        templateInstanceFunc, function () {
+          return f.call(self, c);
+        });
     });
   };
 
   // Give the autorun function a better name for debugging and profiling.
   // The `displayName` property is not part of the spec but browsers like Chrome
   // and Firefox prefer it in debuggers over the name function was declared by.
-  locals.f.displayName =
+  func.displayName =
     (self.name || 'anonymous') + ':' + (displayName || 'anonymous');
-  locals.c = Tracker.autorun(locals.f);
+  var comp = Tracker.autorun(func);
 
-  self.onViewDestroyed(function () { locals.c.stop(); });
+  var stopComputation = function () { comp.stop(); };
+  self.onViewDestroyed(stopComputation);
+  comp.onStop(function () {
+    self.removeViewDestroyedListener(stopComputation);
+  });
 
-  return locals.c;
+  return comp;
 };
 
 Blaze.View.prototype._errorIfShouldntCallSubscribe = function () {
@@ -1785,7 +1797,7 @@ Blaze._fireCallbacks = function (view, which) {
     Tracker.nonreactive(function fireCallbacks() {
       var cbs = view._callbacks[which];
       for (var i = 0, N = (cbs && cbs.length); i < N; i++)
-        cbs[i].call(view);
+        cbs[i] && cbs[i].call(view);
     });
   });
 };
@@ -2439,6 +2451,40 @@ Blaze.With = function (data, contentFunc) {
 };
 
 /**
+ * Attaches bindings to the instantiated view.
+ * @param {Object} bindings A dictionary of bindings, each binding name
+ * corresponds to a value or a function that will be reactively re-run.
+ * @param {View} view The target.
+ */
+Blaze._attachBindingsToView = function (bindings, view) {
+  view.onViewCreated(function () {
+    _.each(bindings, function (binding, name) {
+      view._scopeBindings[name] = new ReactiveVar;
+      if (typeof binding === 'function') {
+        view.autorun(function () {
+          view._scopeBindings[name].set(binding());
+        }, view.parentView);
+      } else {
+        view._scopeBindings[name].set(binding);
+      }
+    });
+  });
+};
+
+/**
+ * @summary Constructs a View setting the local lexical scope in the block.
+ * @param {Function} bindings Dictionary mapping names of bindings to
+ * values or computations to reactively re-run.
+ * @param {Function} contentFunc A Function that returns [*renderable content*](#renderable_content).
+ */
+Blaze.Let = function (bindings, contentFunc) {
+  var view = Blaze.View('let', contentFunc);
+  Blaze._attachBindingsToView(bindings, view);
+
+  return view;
+};
+
+/**
  * @summary Constructs a View that renders content conditionally.
  * @locus Client
  * @param {Function} conditionFunc A function to reactively re-run.  Whether the result is truthy or falsy determines whether `contentFunc` or `elseFunc` is shown.  An empty array is considered falsy.
@@ -2477,9 +2523,22 @@ Blaze.Unless = function (conditionFunc, contentFunc, elseFunc) {
 /**
  * @summary Constructs a View that renders `contentFunc` for each item in a sequence.
  * @locus Client
- * @param {Function} argFunc A function to reactively re-run.  The function may return a Cursor, an array, null, or undefined.
- * @param {Function} contentFunc A Function that returns [*renderable content*](#renderable_content).
- * @param {Function} [elseFunc] Optional.  A Function that returns [*renderable content*](#renderable_content) to display in the case when there are no items to display.
+ * @param {Function} argFunc A function to reactively re-run. The function can
+ * return one of two options:
+ *
+ * 1. An object with two fields: '_variable' and '_sequence'. Each iterates over
+ *   '_sequence', it may be a Cursor, an array, null, or undefined. Inside the
+ *   Each body you will be able to get the current item from the sequence using
+ *   the name specified in the '_variable' field.
+ *
+ * 2. Just a sequence (Cursor, array, null, or undefined) not wrapped into an
+ *   object. Inside the Each body, the current item will be set as the data
+ *   context.
+ * @param {Function} contentFunc A Function that returns  [*renderable
+ * content*](#renderable_content).
+ * @param {Function} [elseFunc] A Function that returns [*renderable
+ * content*](#renderable_content) to display in the case when there are no items
+ * in the sequence.
  */
 Blaze.Each = function (argFunc, contentFunc, elseFunc) {
   var eachView = Blaze.View('each', function () {
@@ -2498,13 +2557,34 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
   eachView.contentFunc = contentFunc;
   eachView.elseFunc = elseFunc;
   eachView.argVar = new ReactiveVar;
+  eachView.variableName = null;
+
+  // update the @index value in the scope of all subviews in the range
+  var updateIndices = function (from, to) {
+    if (to === undefined) {
+      to = eachView.numItems - 1;
+    }
+
+    for (var i = from; i <= to; i++) {
+      var view = eachView._domrange.members[i].view;
+      view._scopeBindings['@index'].set(i);
+    }
+  };
 
   eachView.onViewCreated(function () {
     // We evaluate argFunc in an autorun to make sure
     // Blaze.currentView is always set when it runs (rather than
     // passing argFunc straight to ObserveSequence).
     eachView.autorun(function () {
-      eachView.argVar.set(argFunc());
+      // argFunc can return either a sequence as is or a wrapper object with a
+      // _sequence and _variable fields set.
+      var arg = argFunc();
+      if (_.isObject(arg) && _.has(arg, '_sequence')) {
+        eachView.variableName = arg._variable || null;
+        arg = arg._sequence;
+      }
+
+      eachView.argVar.set(arg);
     }, eachView.parentView, 'collection');
 
     eachView.stopHandle = ObserveSequence.observe(function () {
@@ -2512,8 +2592,23 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
     }, {
       addedAt: function (id, item, index) {
         Tracker.nonreactive(function () {
-          var newItemView = Blaze.With(item, eachView.contentFunc);
+          var newItemView;
+          if (eachView.variableName) {
+            // new-style #each (as in {{#each item in items}})
+            // doesn't create a new data context
+            newItemView = Blaze.View('item', eachView.contentFunc);
+          } else {
+            newItemView = Blaze.With(item, eachView.contentFunc);
+          }
+
           eachView.numItems++;
+
+          var bindings = {};
+          bindings['@index'] = index;
+          if (eachView.variableName) {
+            bindings[eachView.variableName] = item;
+          }
+          Blaze._attachBindingsToView(bindings, newItemView);
 
           if (eachView.expandedValueDep) {
             eachView.expandedValueDep.changed();
@@ -2525,6 +2620,7 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
 
             var range = Blaze._materializeView(newItemView, eachView);
             eachView._domrange.addMember(range, index);
+            updateIndices(index);
           } else {
             eachView.initialSubviews.splice(index, 0, newItemView);
           }
@@ -2537,6 +2633,7 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
             eachView.expandedValueDep.changed();
           } else if (eachView._domrange) {
             eachView._domrange.removeMember(index);
+            updateIndices(index);
             if (eachView.elseFunc && eachView.numItems === 0) {
               eachView.inElseMode = true;
               eachView._domrange.addMember(
@@ -2560,7 +2657,11 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
             } else {
               itemView = eachView.initialSubviews[index];
             }
-            itemView.dataVar.set(newItem);
+            if (eachView.variableName) {
+              itemView._scopeBindings[eachView.variableName].set(newItem);
+            } else {
+              itemView.dataVar.set(newItem);
+            }
           }
         });
       },
@@ -2570,6 +2671,8 @@ Blaze.Each = function (argFunc, contentFunc, elseFunc) {
             eachView.expandedValueDep.changed();
           } else if (eachView._domrange) {
             eachView._domrange.moveMember(fromIndex, toIndex);
+            updateIndices(
+              Math.min(fromIndex, toIndex), Math.max(fromIndex, toIndex));
           } else {
             var subviews = eachView.initialSubviews;
             var itemView = subviews[fromIndex];
@@ -2663,6 +2766,7 @@ Blaze._InOuterTemplateScope = function (templateView, contentFunc) {
   view.onViewCreated(function () {
     this.originalParentView = this.parentView;
     this.parentView = parentView;
+    this.__childDoesntStartNewLexicalScope = true;
   });
   return view;
 };
@@ -2676,6 +2780,11 @@ Blaze._globalHelpers = {};
 Blaze.registerHelper = function (name, func) {
   Blaze._globalHelpers[name] = func;
 };
+
+// Also documented as Template.deregisterHelper
+Blaze.deregisterHelper = function(name) {
+  delete Blaze._globalHelpers[name];
+}
 
 var bindIfIsFunction = function (x, target) {
   if (typeof x !== 'function')
@@ -2699,7 +2808,7 @@ var bindDataContext = function (x) {
 
 Blaze._OLDSTYLE_HELPER = {};
 
-var getTemplateHelper = Blaze._getTemplateHelper = function (template, name) {
+Blaze._getTemplateHelper = function (template, name, tmplInstanceFunc) {
   // XXX COMPAT WITH 0.9.3
   var isKnownOldStyleHelper = false;
 
@@ -2707,8 +2816,10 @@ var getTemplateHelper = Blaze._getTemplateHelper = function (template, name) {
     var helper = template.__helpers.get(name);
     if (helper === Blaze._OLDSTYLE_HELPER) {
       isKnownOldStyleHelper = true;
+    } else if (helper != null) {
+      return wrapHelper(bindDataContext(helper), tmplInstanceFunc);
     } else {
-      return helper;
+      return null;
     }
   }
 
@@ -2723,7 +2834,9 @@ var getTemplateHelper = Blaze._getTemplateHelper = function (template, name) {
                     '.helpers(...)` instead.');
       }
     }
-    return template[name];
+    if (template[name] != null) {
+      return wrapHelper(bindDataContext(template[name]), tmplInstanceFunc);
+    }
   }
 
   return null;
@@ -2744,6 +2857,45 @@ var wrapHelper = function (f, templateFunc) {
   };
 };
 
+Blaze._lexicalBindingLookup = function (view, name) {
+  var currentView = view;
+  var blockHelpersStack = [];
+
+  // walk up the views stopping at a Spacebars.include or Template view that
+  // doesn't have an InOuterTemplateScope view as a parent
+  do {
+    // skip block helpers views
+    // if we found the binding on the scope, return it
+    if (_.has(currentView._scopeBindings, name)) {
+      var bindingReactiveVar = currentView._scopeBindings[name];
+      return function () {
+        return bindingReactiveVar.get();
+      };
+    }
+  } while (! (currentView.__startsNewLexicalScope &&
+              ! (currentView.parentView &&
+                 currentView.parentView.__childDoesntStartNewLexicalScope))
+           && (currentView = currentView.parentView));
+
+  return null;
+};
+
+// templateInstance argument is provided to be available for possible
+// alternative implementations of this function by 3rd party packages.
+Blaze._getTemplate = function (name, templateInstance) {
+  if ((name in Blaze.Template) && (Blaze.Template[name] instanceof Blaze.Template)) {
+    return Blaze.Template[name];
+  }
+  return null;
+};
+
+Blaze._getGlobalHelper = function (name, templateInstance) {
+  if (Blaze._globalHelpers[name] != null) {
+    return wrapHelper(bindDataContext(Blaze._globalHelpers[name]), templateInstance);
+  }
+  return null;
+};
+
 // Looks up a name, like "foo" or "..", as a helper of the
 // current template; the name of a template; a global helper;
 // or a property of the data context.  Called on the View of
@@ -2762,12 +2914,15 @@ Blaze.View.prototype.lookup = function (name, _options) {
   var template = this.template;
   var lookupTemplate = _options && _options.template;
   var helper;
+  var binding;
   var boundTmplInstance;
+  var foundTemplate;
 
   if (this.templateInstance) {
     boundTmplInstance = _.bind(this.templateInstance, this);
   }
 
+  // 0. looking up the parent data context with the special "../" syntax
   if (/^\./.test(name)) {
     // starts with a dot. must be a series of dots which maps to an
     // ancestor of the appropriate height.
@@ -2776,38 +2931,61 @@ Blaze.View.prototype.lookup = function (name, _options) {
 
     return Blaze._parentData(name.length - 1, true /*_functionWrapped*/);
 
-  } else if (template &&
-             ((helper = getTemplateHelper(template, name)) != null)) {
-    return wrapHelper(bindDataContext(helper), boundTmplInstance);
-  } else if (lookupTemplate && (name in Blaze.Template) &&
-             (Blaze.Template[name] instanceof Blaze.Template)) {
-    return Blaze.Template[name];
-  } else if (Blaze._globalHelpers[name] != null) {
-    return wrapHelper(bindDataContext(Blaze._globalHelpers[name]),
-      boundTmplInstance);
-  } else {
-    return function () {
-      var isCalledAsFunction = (arguments.length > 0);
-      var data = Blaze.getData();
-      if (lookupTemplate && ! (data && data[name])) {
-        throw new Error("No such template: " + name);
-      }
-      if (isCalledAsFunction && ! (data && data[name])) {
-        throw new Error("No such function: " + name);
-      }
-      if (! data)
-        return null;
-      var x = data[name];
-      if (typeof x !== 'function') {
-        if (isCalledAsFunction) {
-          throw new Error("Can't call non-function: " + x);
-        }
-        return x;
-      }
-      return x.apply(data, arguments);
-    };
   }
-  return null;
+
+  // 1. look up a helper on the current template
+  if (template && ((helper = Blaze._getTemplateHelper(template, name, boundTmplInstance)) != null)) {
+    return helper;
+  }
+
+  // 2. look up a binding by traversing the lexical view hierarchy inside the
+  // current template
+  if (template && (binding = Blaze._lexicalBindingLookup(Blaze.currentView, name)) != null) {
+    return binding;
+  }
+
+  // 3. look up a template by name
+  if (lookupTemplate && ((foundTemplate = Blaze._getTemplate(name, boundTmplInstance)) != null)) {
+    return foundTemplate;
+  }
+
+  // 4. look up a global helper
+  if ((helper = Blaze._getGlobalHelper(name, boundTmplInstance)) != null) {
+    return helper;
+  }
+
+  // 5. look up in a data context
+  return function () {
+    var isCalledAsFunction = (arguments.length > 0);
+    var data = Blaze.getData();
+    var x = data && data[name];
+    if (! x) {
+      if (lookupTemplate) {
+        throw new Error("No such template: " + name);
+      } else if (isCalledAsFunction) {
+        throw new Error("No such function: " + name);
+      } else if (name.charAt(0) === '@' && ((x === null) ||
+                                            (x === undefined))) {
+        // Throw an error if the user tries to use a `@directive`
+        // that doesn't exist.  We don't implement all directives
+        // from Handlebars, so there's a potential for confusion
+        // if we fail silently.  On the other hand, we want to
+        // throw late in case some app or package wants to provide
+        // a missing directive.
+        throw new Error("Unsupported directive: " + name);
+      }
+    }
+    if (! data) {
+      return null;
+    }
+    if (typeof x !== 'function') {
+      if (isCalledAsFunction) {
+        throw new Error("Can't call non-function: " + x);
+      }
+      return x;
+    }
+    return x.apply(data, arguments);
+  };
 };
 
 // Implement Spacebars' {{../..}}.
@@ -2904,6 +3082,7 @@ Blaze.isTemplate = function (t) {
  * @summary Register a function to be called when an instance of this template is created.
  * @param {Function} callback A function to be added as a callback.
  * @locus Client
+ * @importFromPackage templating
  */
 Template.prototype.onCreated = function (cb) {
   this._callbacks.created.push(cb);
@@ -2916,6 +3095,7 @@ Template.prototype.onCreated = function (cb) {
  * @summary Register a function to be called when an instance of this template is inserted into the DOM.
  * @param {Function} callback A function to be added as a callback.
  * @locus Client
+ * @importFromPackage templating
  */
 Template.prototype.onRendered = function (cb) {
   this._callbacks.rendered.push(cb);
@@ -2928,6 +3108,7 @@ Template.prototype.onRendered = function (cb) {
  * @summary Register a function to be called when an instance of this template is removed from the DOM and destroyed.
  * @param {Function} callback A function to be added as a callback.
  * @locus Client
+ * @importFromPackage templating
  */
 Template.prototype.onDestroyed = function (cb) {
   this._callbacks.destroyed.push(cb);
@@ -3199,7 +3380,7 @@ Blaze.TemplateInstance.prototype.subscribe = function (/* arguments */) {
 
     if (_.isFunction(lastParam)) {
       options.onReady = args.pop();
-    } else if (lastParam && Match.test(lastParam, lastParamOptionsPattern)) {
+    } else if (lastParam && ! _.isEmpty(lastParam) && Match.test(lastParam, lastParamOptionsPattern)) {
       options = args.pop();
     }
   }
@@ -3270,8 +3451,13 @@ Blaze.TemplateInstance.prototype.subscriptionsReady = function () {
  * @summary Specify template helpers available to this template.
  * @locus Client
  * @param {Object} helpers Dictionary of helper functions by name.
+ * @importFromPackage templating
  */
 Template.prototype.helpers = function (dict) {
+  if (! _.isObject(dict)) {
+    throw new Error("Helpers dictionary has to be an object");
+  }
+
   for (var k in dict)
     this.__helpers.set(k, dict[k]);
 };
@@ -3299,8 +3485,13 @@ Template._withTemplateInstanceFunc = function (templateInstanceFunc, func) {
  * @summary Specify event handlers for this template.
  * @locus Client
  * @param {EventMap} eventMap Event handlers to associate with this template.
+ * @importFromPackage templating
  */
 Template.prototype.events = function (eventMap) {
+  if (! _.isObject(eventMap)) {
+    throw new Error("Event map has to be an object");
+  }
+
   var template = this;
   var eventMap2 = {};
   for (var k in eventMap) {
@@ -3331,6 +3522,7 @@ Template.prototype.events = function (eventMap) {
  * @summary The [template instance](#template_inst) corresponding to the current template helper, event handler, callback, or autorun.  If there isn't one, `null`.
  * @locus Client
  * @returns {Blaze.TemplateInstance}
+ * @importFromPackage templating
  */
 Template.instance = function () {
   return Template._currentTemplateInstanceFunc
@@ -3353,6 +3545,7 @@ Template.instance = function () {
  * Establishes a reactive dependency on the result.
  * @locus Client
  * @function
+ * @importFromPackage templating
  */
 Template.currentData = Blaze.getData;
 
@@ -3361,6 +3554,7 @@ Template.currentData = Blaze.getData;
  * @locus Client
  * @function
  * @param {Integer} [numLevels] The number of levels beyond the current data context to look. Defaults to 1.
+ * @importFromPackage templating
  */
 Template.parentData = Blaze._parentData;
 
@@ -3370,8 +3564,18 @@ Template.parentData = Blaze._parentData;
  * @function
  * @param {String} name The name of the helper function you are defining.
  * @param {Function} function The helper function itself.
+ * @importFromPackage templating
  */
 Template.registerHelper = Blaze.registerHelper;
+
+/**
+ * @summary Removes a global [helper function](#template_helpers).
+ * @locus Client
+ * @function
+ * @param {String} name The name of the helper function you are defining.
+ * @importFromPackage templating
+ */
+Template.deregisterHelper = Blaze.deregisterHelper;
   Meteor.Blaze = Blaze;
   Meteor.jQuery = jQuery;
 };
